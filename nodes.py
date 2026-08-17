@@ -1,0 +1,332 @@
+"""Save PSD — one layer per prompt/mask, each with a real editable layer mask.
+
+The node is meant to sit at the end of a "prompt list -> SAM3 -> masks" graph:
+every prompt produces one or more masks, and every mask becomes a layer that
+holds a full copy of the source image plus a Photoshop layer mask named after
+the prompt. Nothing is baked in: in Photoshop the mask can be painted on and
+the hidden pixels are still there.
+
+INPUT_IS_LIST is on, so the node collects everything the upstream graph
+produced across its per-prompt executions.
+"""
+
+import json
+import os
+
+import numpy as np
+import torch
+from PIL import Image
+
+import folder_paths
+
+try:
+    from psd_tools import PSDImage
+    from psd_tools.api.layers import Group, PixelLayer
+    from psd_tools.constants import Compression
+
+    PSD_TOOLS_ERROR = None
+except Exception as exc:  # pragma: no cover - depends on the environment
+    PSDImage = None
+    PSD_TOOLS_ERROR = exc
+
+
+def _first(value, default=None):
+    """INPUT_IS_LIST turns every widget value into a one-item list."""
+    if isinstance(value, list):
+        return value[0] if value else default
+    return value if value is not None else default
+
+
+def _iter_images(image_inputs):
+    """-> list of HxWx3 float arrays"""
+    out = []
+    if image_inputs is None:
+        return out
+    items = image_inputs if isinstance(image_inputs, list) else [image_inputs]
+    for t in items:
+        if t is None:
+            continue
+        if isinstance(t, list):
+            out.extend(_iter_images(t))
+            continue
+        t = t if t.dim() == 4 else t.unsqueeze(0)
+        for i in range(t.shape[0]):
+            out.append(t[i].detach().cpu().float().numpy())
+    return out
+
+
+def _iter_mask_groups(mask_inputs):
+    """-> list of groups, each group is a list of HxW float arrays.
+
+    One group per upstream execution (i.e. per prompt) when the graph fans out
+    over a prompt list; a single group holding the whole batch otherwise.
+    """
+    groups = []
+    if mask_inputs is None:
+        return groups
+    items = mask_inputs if isinstance(mask_inputs, list) else [mask_inputs]
+    for t in items:
+        if t is None:
+            continue
+        if isinstance(t, list):
+            groups.extend(_iter_mask_groups(t))
+            continue
+        t = t.detach().cpu().float()
+        if t.dim() == 2:
+            t = t.unsqueeze(0)
+        groups.append([t[i].numpy() for i in range(t.shape[0])])
+    return groups
+
+
+def _collect_names(prompt_list, names):
+    out = []
+    for src in (prompt_list, names):
+        if src is None:
+            continue
+        items = src if isinstance(src, list) else [src]
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, (list, tuple)):
+                out.extend(str(x) for x in item)
+            else:
+                out.append(str(item))
+    return [n for n in (s.strip() for s in out) if n]
+
+
+def _to_pil_rgb(arr):
+    return Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def _to_pil_mask(arr, size):
+    m = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8), mode="L")
+    if m.size != size:
+        m = m.resize(size, Image.BILINEAR)
+    return m
+
+
+class SavePSDLayers:
+    CATEGORY = "image/psd"
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    INPUT_IS_LIST = True
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("psd_path", "layer_count")
+    DESCRIPTION = (
+        "Writes a PSD where every mask becomes a layer: a full copy of the "
+        "image with an editable Photoshop layer mask, named after the prompt "
+        "it came from."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "masks": ("MASK",),
+                "filename_prefix": ("STRING", {"default": "psd/ComfyUI"}),
+                "include_original": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Add the untouched image as the bottom layer.",
+                    },
+                ),
+                "only_first_visible": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Open the file with only the topmost masked layer visible instead of all of them stacked.",
+                    },
+                ),
+                "invert_masks": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "advanced": True,
+                        "tooltip": "Enable when the mask marks what should be hidden (e.g. the LoadImage mask).",
+                    },
+                ),
+                "group_per_prompt": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "advanced": True,
+                        "tooltip": "Put multiple detections of one prompt into a Photoshop group named after that prompt.",
+                    },
+                ),
+                "crop_to_mask": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "advanced": True,
+                        "tooltip": "Store each layer cropped to its mask bounds. Smaller file, but the pixels outside the mask are gone.",
+                    },
+                ),
+            },
+            "optional": {
+                "prompt_list": ("LIST",),
+                "names": ("STRING", {"forceInput": True}),
+            },
+        }
+
+    # -------------------------------------------------------------- helpers
+    @staticmethod
+    def _pair(groups, names):
+        """-> list of (name, mask array)"""
+        flat = [m for g in groups for m in g]
+
+        if names and len(names) == len(groups):
+            pairs = []
+            for name, group in zip(names, groups):
+                if len(group) == 1:
+                    pairs.append((name, group[0]))
+                else:
+                    for i, m in enumerate(group, start=1):
+                        pairs.append((f"{name} {i}", m))
+            return pairs
+
+        if names and len(names) == len(flat):
+            return list(zip(names, flat))
+
+        pairs = []
+        for i, m in enumerate(flat):
+            pairs.append((names[i] if names and i < len(names) else f"layer {i + 1}", m))
+        return pairs
+
+    @staticmethod
+    def _group_index(groups, names):
+        """Which prompt each flat mask belongs to (for group_per_prompt)."""
+        idx = []
+        for gi, group in enumerate(groups):
+            label = names[gi] if names and gi < len(names) else f"prompt {gi + 1}"
+            for _ in group:
+                idx.append((gi, label))
+        return idx
+
+    # ------------------------------------------------------------------ run
+    def run(
+        self,
+        image,
+        masks,
+        filename_prefix="psd/ComfyUI",
+        include_original=True,
+        only_first_visible=False,
+        invert_masks=False,
+        group_per_prompt=False,
+        crop_to_mask=False,
+        prompt_list=None,
+        names=None,
+    ):
+        if PSDImage is None:
+            raise RuntimeError(
+                "psd-tools is required for the Save PSD node. Install it into the "
+                "ComfyUI python environment: pip install psd-tools>=1.18  "
+                f"(import error: {PSD_TOOLS_ERROR})"
+            )
+
+        filename_prefix = _first(filename_prefix, "psd/ComfyUI")
+        include_original = bool(_first(include_original, True))
+        only_first_visible = bool(_first(only_first_visible, False))
+        invert_masks = bool(_first(invert_masks, False))
+        group_per_prompt = bool(_first(group_per_prompt, False))
+        crop_to_mask = bool(_first(crop_to_mask, False))
+
+        images = _iter_images(image)
+        if not images:
+            raise ValueError("Save PSD: no image on the input")
+
+        groups = _iter_mask_groups(masks)
+        flat_count = sum(len(g) for g in groups)
+        if flat_count == 0:
+            raise ValueError("Save PSD: no masks on the input")
+
+        layer_names = _collect_names(prompt_list, names)
+        pairs = self._pair(groups, layer_names)
+        group_index = self._group_index(groups, layer_names)
+
+        base = images[0]
+        h, w = base.shape[:2]
+        size = (w, h)
+
+        full_output_folder, filename, counter, subfolder, _ = (
+            folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory(), w, h)
+        )
+        psd_name = f"{filename}_{counter:05}_.psd"
+        psd_path = os.path.join(full_output_folder, psd_name)
+
+        psd = PSDImage.new("RGB", size)
+
+        if include_original:
+            PixelLayer.frompil(
+                _to_pil_rgb(base), psd, name="original", compression=Compression.RLE
+            )
+
+        open_groups = {}
+        # layers are appended bottom-up: walk the prompts backwards so that in
+        # Photoshop the panel reads top-down in prompt order
+        for i in range(len(pairs) - 1, -1, -1):
+            name, mask = pairs[i]
+            src = images[i] if len(images) == len(pairs) else base
+            if src.shape[:2] != (h, w):
+                src = np.asarray(
+                    Image.fromarray(
+                        np.clip(src * 255, 0, 255).astype(np.uint8)
+                    ).resize(size, Image.BILINEAR),
+                    dtype=np.float32,
+                ) / 255.0
+
+            m = 1.0 - mask if invert_masks else mask
+            rgb = _to_pil_rgb(src)
+            alpha = _to_pil_mask(m, size)
+
+            top, left = 0, 0
+            if crop_to_mask:
+                bbox = alpha.getbbox()
+                if bbox:
+                    left, top = bbox[0], bbox[1]
+                    rgb = rgb.crop(bbox)
+                    alpha = alpha.crop(bbox)
+
+            rgba = rgb.convert("RGBA")
+            rgba.putalpha(alpha)
+
+            parent = psd
+            if group_per_prompt and i < len(group_index):
+                gi, label = group_index[i]
+                sizes = [len(g) for g in groups]
+                if gi < len(sizes) and sizes[gi] > 1:
+                    if gi not in open_groups:
+                        open_groups[gi] = Group.new(psd, name=label)
+                    parent = open_groups[gi]
+
+            layer = PixelLayer.frompil(
+                rgba, parent, name=name, top=top, left=left, compression=Compression.RLE
+            )
+            if only_first_visible and i != 0:
+                layer.visible = False
+
+        psd.save(psd_path)
+
+        # small flattened preview so the node shows something in the UI
+        preview_dir = folder_paths.get_temp_directory()
+        os.makedirs(preview_dir, exist_ok=True)
+        preview_name = f"{filename}_{counter:05}_psd_preview.png"
+        composite = psd.composite()
+        if composite is not None:
+            composite.convert("RGB").save(os.path.join(preview_dir, preview_name))
+            ui_images = [
+                {"filename": preview_name, "subfolder": "", "type": "temp"}
+            ]
+        else:
+            ui_images = []
+
+        rel = os.path.join(subfolder, psd_name) if subfolder else psd_name
+        return {
+            "ui": {"images": ui_images, "text": [rel]},
+            "result": (psd_path, len(pairs) + (1 if include_original else 0)),
+        }
+
+
+NODE_CLASS_MAPPINGS = {"SavePSDLayers": SavePSDLayers}
+NODE_DISPLAY_NAME_MAPPINGS = {"SavePSDLayers": "Save PSD (masked layers)"}
