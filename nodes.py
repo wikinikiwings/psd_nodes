@@ -308,22 +308,20 @@ class SavePSDLayers:
 
         psd.save(psd_path)
 
-        # small flattened preview so the node shows something in the UI
-        preview_dir = folder_paths.get_temp_directory()
-        os.makedirs(preview_dir, exist_ok=True)
-        preview_name = f"{filename}_{counter:05}_psd_preview.png"
-        composite = psd.composite()
-        if composite is not None:
-            composite.convert("RGB").save(os.path.join(preview_dir, preview_name))
-            ui_images = [
-                {"filename": preview_name, "subfolder": "", "type": "temp"}
-            ]
-        else:
-            ui_images = []
-
+        # no preview file is written: the node hands the frontend a reference to
+        # the saved PSD and the JS extension turns it into a browser download
         rel = os.path.join(subfolder, psd_name) if subfolder else psd_name
         return {
-            "ui": {"images": ui_images, "text": [rel]},
+            "ui": {
+                "psd": [
+                    {
+                        "filename": psd_name,
+                        "subfolder": subfolder,
+                        "type": "output",
+                    }
+                ],
+                "text": [rel],
+            },
             "result": (psd_path, len(pairs) + (1 if include_original else 0)),
         }
 
