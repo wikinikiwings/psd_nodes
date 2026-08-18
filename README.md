@@ -7,10 +7,12 @@
 ## Зависимости
 
 ```
-pip install psd-tools>=1.18
+pip install "psd-tools>=1.11"
 ```
 
 Ставить нужно в тот же python, в котором работает ComfyUI. Зависимости у самой psd-tools лёгкие (numpy, Pillow, attrs, typing-extensions), под Windows есть готовые колёса для python 3.10–3.14.
+
+Нижняя граница именно 1.11: в этой версии переименовали API записи — `PixelLayer.frompil(..., name=...)` вместо `layer_name=` и `Group.new(parent, name, open_folder)` вместо `Group.new(name, open_folder, parent=...)`. На 1.10.x нода откажется грузиться с внятной ошибкой, а не молча назовёт все слои `Layer`. Проверено на 1.14.2 и 1.18.0.
 
 ## Нода `Save PSD (masked layers)` — категория `image/psd`
 

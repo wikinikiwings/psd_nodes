@@ -3,7 +3,7 @@ name = "comfyui-psd-export"
 description = "Export ComfyUI masks as a layered PSD: one layer per prompt, each with an editable Photoshop layer mask"
 version = "0.1.0"
 license = { text = "MIT" }
-dependencies = ["psd-tools>=1.18"]
+dependencies = ["psd-tools>=1.11"]
 
 [project.urls]
 Repository = "https://github.com/wikinikiwings/comfyui-psd-export"

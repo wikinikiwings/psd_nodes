@@ -19,10 +19,34 @@ from PIL import Image
 
 import folder_paths
 
+PSD_TOOLS_MIN = "1.11"
+
 try:
+    import psd_tools
     from psd_tools import PSDImage
     from psd_tools.api.layers import Group, PixelLayer
-    from psd_tools.constants import Compression
+    from psd_tools.constants import ChannelID, Compression, TaggedBlockID
+    from psd_tools.psd.layer_and_mask import (
+        ChannelData,
+        ChannelInfo,
+        MaskData,
+        MaskFlags,
+    )
+
+    # psd-tools renamed the writing API in 1.11.0: PixelLayer.frompil() took
+    # `layer_name` and Group.new() took `parent` last. On <1.11 the calls below
+    # would fail loudly (Group.new) or, worse, silently name every layer
+    # "Layer", so refuse to load instead of writing a broken PSD.
+    import inspect as _inspect
+
+    if (
+        not hasattr(Group, "new")
+        or next(iter(_inspect.signature(Group.new).parameters)) != "parent"
+    ):
+        raise ImportError(
+            f"psd-tools {getattr(psd_tools, '__version__', '?')} is too old, "
+            f"need >= {PSD_TOOLS_MIN}"
+        )
 
     PSD_TOOLS_ERROR = None
 except Exception as exc:  # pragma: no cover - depends on the environment
@@ -105,6 +129,52 @@ def _to_pil_mask(arr, size):
     return m
 
 
+def _set_layer_name(layer, name):
+    """Name a layer so that non-latin prompts survive.
+
+    A PSD stores the layer name twice: a legacy pascal string in the record
+    (macroman, so `psd.save()` raises UnicodeEncodeError on anything Cyrillic)
+    and a 'luni' tagged block with the real unicode name. Photoshop reads the
+    unicode one, so the legacy field only needs to be encodable.
+    """
+    layer._record.name = name.encode("macroman", "replace").decode("macroman")
+    layer._record.tagged_blocks.set_data(TaggedBlockID.UNICODE_LAYER_NAME, name)
+
+
+def _attach_layer_mask(layer, mask_pil, crop_to_mask=False):
+    """Attach a PIL "L" image to `layer` as an editable Photoshop layer mask.
+
+    psd-tools has no high-level API for creating layer masks, so the raw
+    records are built here: a USER_LAYER_MASK channel plus a MaskData record.
+    Photoshop hides whatever the mask paints black; the layer pixels stay
+    intact, so the mask can be repainted or removed at any time.
+    """
+    top, left = 0, 0
+    right, bottom = mask_pil.width, mask_pil.height
+    if crop_to_mask:
+        bbox = mask_pil.getbbox()
+        if bbox:
+            left, top, right, bottom = bbox
+            mask_pil = mask_pil.crop(bbox)
+
+    channel = ChannelData(Compression.RLE)
+    channel.set_data(mask_pil.tobytes(), mask_pil.width, mask_pil.height, 8)
+
+    layer._record.mask_data = MaskData(
+        top=top,
+        left=left,
+        bottom=bottom,
+        right=right,
+        # everything outside the mask rectangle is hidden
+        background_color=0,
+        flags=MaskFlags(),
+    )
+    layer._record.channel_info.append(
+        ChannelInfo(id=ChannelID.USER_LAYER_MASK, length=len(channel.data) + 2)
+    )
+    layer._channels.append(channel)
+
+
 class SavePSDLayers:
     CATEGORY = "image/psd"
     FUNCTION = "run"
@@ -160,7 +230,7 @@ class SavePSDLayers:
                     {
                         "default": False,
                         "advanced": True,
-                        "tooltip": "Store each layer cropped to its mask bounds. Smaller file, but the pixels outside the mask are gone.",
+                        "tooltip": "Crop the layer mask channel to its bounding box. The layer itself keeps the full image; everything outside the mask rectangle stays hidden.",
                     },
                 ),
             },
@@ -221,7 +291,7 @@ class SavePSDLayers:
         if PSDImage is None:
             raise RuntimeError(
                 "psd-tools is required for the Save PSD node. Install it into the "
-                "ComfyUI python environment: pip install psd-tools>=1.18  "
+                f"ComfyUI python environment: pip install 'psd-tools>={PSD_TOOLS_MIN}'  "
                 f"(import error: {PSD_TOOLS_ERROR})"
             )
 
@@ -258,9 +328,10 @@ class SavePSDLayers:
         psd = PSDImage.new("RGB", size)
 
         if include_original:
-            PixelLayer.frompil(
+            original = PixelLayer.frompil(
                 _to_pil_rgb(base), psd, name="original", compression=Compression.RLE
             )
+            psd.append(original)
 
         open_groups = {}
         # layers are appended bottom-up: walk the prompts backwards so that in
@@ -278,18 +349,7 @@ class SavePSDLayers:
 
             m = 1.0 - mask if invert_masks else mask
             rgb = _to_pil_rgb(src)
-            alpha = _to_pil_mask(m, size)
-
-            top, left = 0, 0
-            if crop_to_mask:
-                bbox = alpha.getbbox()
-                if bbox:
-                    left, top = bbox[0], bbox[1]
-                    rgb = rgb.crop(bbox)
-                    alpha = alpha.crop(bbox)
-
-            rgba = rgb.convert("RGBA")
-            rgba.putalpha(alpha)
+            mask_pil = _to_pil_mask(m, size)
 
             parent = psd
             if group_per_prompt and i < len(group_index):
@@ -297,12 +357,17 @@ class SavePSDLayers:
                 sizes = [len(g) for g in groups]
                 if gi < len(sizes) and sizes[gi] > 1:
                     if gi not in open_groups:
-                        open_groups[gi] = Group.new(psd, name=label)
+                        grp = Group.new(psd, open_folder=True)
+                        _set_layer_name(grp, label)
+                        open_groups[gi] = grp
                     parent = open_groups[gi]
 
-            layer = PixelLayer.frompil(
-                rgba, parent, name=name, top=top, left=left, compression=Compression.RLE
-            )
+            # non-destructive: the layer keeps the full, untouched image; the
+            # cut-out lives in a separate editable Photoshop layer mask
+            layer = PixelLayer.frompil(rgb, psd, compression=Compression.RLE)
+            _set_layer_name(layer, name)
+            parent.append(layer)
+            _attach_layer_mask(layer, mask_pil, crop_to_mask)
             if only_first_visible and i != 0:
                 layer.visible = False
 

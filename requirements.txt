@@ -1,1 +1,1 @@
-psd-tools>=1.18
+psd-tools>=1.11
