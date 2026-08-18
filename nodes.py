@@ -36,6 +36,9 @@ except Exception:  # pragma: no cover - depends on the environment
 
 _PENDING = OrderedDict()   # token -> {"data": bytes, "filename": str, "at": float}
 _MAX_PENDING = 3           # only the last few runs stay downloadable
+# ...and a hard ceiling on what they may weigh together: every layer holds a
+# full copy of the image, so a run with ~30 parts is easily several hundred MB.
+_MAX_PENDING_BYTES = 512 * 1024 * 1024
 _ROUTE = "/psd_export/download"
 
 PSD_TOOLS_MIN = "1.11"
@@ -77,7 +80,12 @@ def _remember_psd(data, filename):
     """Park the bytes for the download button and return their token."""
     token = uuid.uuid4().hex
     _PENDING[token] = {"data": data, "filename": filename, "at": time.time()}
-    while len(_PENDING) > _MAX_PENDING:
+    # The newest run is never evicted, even when it alone busts the budget:
+    # dropping what was just generated would leave the button pointing at 404.
+    while len(_PENDING) > 1 and (
+        len(_PENDING) > _MAX_PENDING
+        or sum(len(e["data"]) for e in _PENDING.values()) > _MAX_PENDING_BYTES
+    ):
         _PENDING.popitem(last=False)
     return token
 
@@ -275,16 +283,6 @@ class SavePSDLayers:
                 "image": ("IMAGE",),
                 "masks": ("MASK",),
                 "filename_prefix": ("STRING", {"default": "psd/ComfyUI"}),
-                "save_to_disk": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": "Off: the PSD only lives in memory until you "
-                                   "press download - nothing is written to "
-                                   "ComfyUI/output. On: also keep a copy on disk "
-                                   "under filename_prefix.",
-                    },
-                ),
                 "include_original": (
                     "BOOLEAN",
                     {
@@ -321,6 +319,21 @@ class SavePSDLayers:
                         "default": False,
                         "advanced": True,
                         "tooltip": "Crop the layer mask channel to its bounding box. The layer itself keeps the full image; everything outside the mask rectangle stays hidden.",
+                    },
+                ),
+                # Kept LAST on purpose: ComfyUI restores widget values by
+                # position, so a switch inserted in the middle would silently
+                # take over the value of the widget that used to sit there
+                # (adding it after filename_prefix made old graphs read
+                # include_original=True as save_to_disk=True).
+                "save_to_disk": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Off: the PSD only lives in memory until you "
+                                   "press download - nothing is written to "
+                                   "ComfyUI/output. On: also keep a copy on disk "
+                                   "under filename_prefix.",
                     },
                 ),
             },
@@ -370,12 +383,12 @@ class SavePSDLayers:
         image,
         masks,
         filename_prefix="psd/ComfyUI",
-        save_to_disk=False,
         include_original=True,
         only_first_visible=False,
         invert_masks=False,
         group_per_prompt=False,
         crop_to_mask=False,
+        save_to_disk=False,
         prompt_list=None,
         names=None,
     ):
