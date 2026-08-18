@@ -102,20 +102,35 @@ def _iter_mask_groups(mask_inputs):
     return groups
 
 
-def _collect_names(prompt_list, names):
+def _flatten_names(src):
     out = []
-    for src in (prompt_list, names):
-        if src is None:
+    if src is None:
+        return out
+    items = src if isinstance(src, list) else [src]
+    for item in items:
+        if item is None:
             continue
-        items = src if isinstance(src, list) else [src]
-        for item in items:
-            if item is None:
-                continue
-            if isinstance(item, (list, tuple)):
-                out.extend(str(x) for x in item)
-            else:
-                out.append(str(item))
+        if isinstance(item, (list, tuple)):
+            out.extend(str(x) for x in item)
+        else:
+            out.append(str(item))
     return [n for n in (s.strip() for s in out) if n]
+
+
+def _collect_names(prompt_list, names):
+    """`names` wins over `prompt_list` — the two are never concatenated.
+
+    `prompt_list` holds one string per prompt and only lines up with the masks
+    while every prompt owns exactly one of them. `names` is expected to carry
+    one string per mask, which stays correct even when a prompt produced
+    several detections or an upstream node flattened the per-prompt batches.
+    Summing both sources (the old behaviour) doubled the list whenever both
+    inputs were wired and pushed naming into the positional fallback.
+    """
+    per_mask = _flatten_names(names)
+    if per_mask:
+        return per_mask
+    return _flatten_names(prompt_list)
 
 
 def _to_pil_rgb(arr):
@@ -314,6 +329,24 @@ class SavePSDLayers:
         layer_names = _collect_names(prompt_list, names)
         pairs = self._pair(groups, layer_names)
         group_index = self._group_index(groups, layer_names)
+
+        # Naming depends on how the masks arrived: one name per prompt only
+        # works while the per-prompt grouping survives the graph. Say out loud
+        # what was matched, so a silent mismatch (names shifted by one, tail
+        # called "layer N") is visible in the log instead of only in the PSD.
+        if layer_names and len(layer_names) not in (len(groups), flat_count):
+            print(
+                f"[Save PSD] ВНИМАНИЕ: имён {len(layer_names)}, а групп масок "
+                f"{len(groups)} (кадров всего {flat_count}). Имена расставлены "
+                f"по порядку и почти наверняка съехали. Если промт может дать "
+                f"несколько находок (max_detections=-1), подайте в 'names' "
+                f"список с именем на КАЖДУЮ маску."
+            )
+        else:
+            print(
+                f"[Save PSD] групп масок {len(groups)}, кадров {flat_count}, "
+                f"имён {len(layer_names)} -> слоёв {len(pairs)}"
+            )
 
         base = images[0]
         h, w = base.shape[:2]
