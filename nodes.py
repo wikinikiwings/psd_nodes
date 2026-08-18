@@ -10,14 +10,33 @@ INPUT_IS_LIST is on, so the node collects everything the upstream graph
 produced across its per-prompt executions.
 """
 
+import io
 import json
 import os
+import time
+import uuid
+from collections import OrderedDict
 
 import numpy as np
 import torch
 from PIL import Image
 
 import folder_paths
+
+# The PSD is handed to the browser straight from memory: a generated file is
+# wanted once, right after the run, and writing every one of them into
+# ComfyUI/output only fills the disk with files nobody comes back to. Set the
+# node's save_to_disk to True when a permanent copy IS wanted.
+try:
+    from aiohttp import web as _web
+    from server import PromptServer as _PromptServer
+except Exception:  # pragma: no cover - depends on the environment
+    _web = None
+    _PromptServer = None
+
+_PENDING = OrderedDict()   # token -> {"data": bytes, "filename": str, "at": float}
+_MAX_PENDING = 3           # only the last few runs stay downloadable
+_ROUTE = "/psd_export/download"
 
 PSD_TOOLS_MIN = "1.11"
 
@@ -52,6 +71,52 @@ try:
 except Exception as exc:  # pragma: no cover - depends on the environment
     PSDImage = None
     PSD_TOOLS_ERROR = exc
+
+
+def _remember_psd(data, filename):
+    """Park the bytes for the download button and return their token."""
+    token = uuid.uuid4().hex
+    _PENDING[token] = {"data": data, "filename": filename, "at": time.time()}
+    while len(_PENDING) > _MAX_PENDING:
+        _PENDING.popitem(last=False)
+    return token
+
+
+def _register_download_route():
+    """GET <route>/{token} -> the PSD, served once from RAM.
+
+    The entry is kept after sending: a browser may retry the request, and the
+    user may click download twice. Nothing survives a ComfyUI restart, and at
+    most _MAX_PENDING files are held at a time.
+    """
+    if _PromptServer is None or _web is None:
+        return False
+    instance = getattr(_PromptServer, "instance", None)
+    if instance is None or not hasattr(instance, "routes"):
+        return False
+
+    @instance.routes.get(_ROUTE + "/{token}")
+    async def _serve_psd(request):  # pragma: no cover - needs a live server
+        entry = _PENDING.get(request.match_info.get("token", ""))
+        if entry is None:
+            return _web.Response(
+                status=404,
+                text="This PSD is gone (server restarted or newer runs pushed "
+                     "it out). Run the graph again.",
+            )
+        return _web.Response(
+            body=entry["data"],
+            content_type="image/vnd.adobe.photoshop",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="{entry["filename"]}"',
+            },
+        )
+
+    return True
+
+
+_ROUTE_READY = _register_download_route()
 
 
 def _first(value, default=None):
@@ -210,6 +275,16 @@ class SavePSDLayers:
                 "image": ("IMAGE",),
                 "masks": ("MASK",),
                 "filename_prefix": ("STRING", {"default": "psd/ComfyUI"}),
+                "save_to_disk": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Off: the PSD only lives in memory until you "
+                                   "press download - nothing is written to "
+                                   "ComfyUI/output. On: also keep a copy on disk "
+                                   "under filename_prefix.",
+                    },
+                ),
                 "include_original": (
                     "BOOLEAN",
                     {
@@ -295,6 +370,7 @@ class SavePSDLayers:
         image,
         masks,
         filename_prefix="psd/ComfyUI",
+        save_to_disk=False,
         include_original=True,
         only_first_visible=False,
         invert_masks=False,
@@ -311,6 +387,7 @@ class SavePSDLayers:
             )
 
         filename_prefix = _first(filename_prefix, "psd/ComfyUI")
+        save_to_disk = bool(_first(save_to_disk, False))
         include_original = bool(_first(include_original, True))
         only_first_visible = bool(_first(only_first_visible, False))
         invert_masks = bool(_first(invert_masks, False))
@@ -352,11 +429,19 @@ class SavePSDLayers:
         h, w = base.shape[:2]
         size = (w, h)
 
-        full_output_folder, filename, counter, subfolder, _ = (
-            folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory(), w, h)
-        )
-        psd_name = f"{filename}_{counter:05}_.psd"
-        psd_path = os.path.join(full_output_folder, psd_name)
+        # The output folder is only touched when a copy on disk was asked for;
+        # get_save_image_path() creates the subfolder as a side effect, so it
+        # must not run in the memory-only path.
+        if save_to_disk:
+            full_output_folder, filename, counter, subfolder, _ = (
+                folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory(), w, h)
+            )
+            psd_name = f"{filename}_{counter:05}_.psd"
+            psd_path = os.path.join(full_output_folder, psd_name)
+        else:
+            stem = os.path.basename(str(filename_prefix).rstrip("/\\")) or "ComfyUI"
+            psd_name = f"{stem}_{time.strftime('%Y%m%d-%H%M%S')}.psd"
+            subfolder, psd_path = "", ""
 
         psd = PSDImage.new("RGB", size)
 
@@ -404,23 +489,43 @@ class SavePSDLayers:
             if only_first_visible and i != 0:
                 layer.visible = False
 
-        psd.save(psd_path)
+        buffer = io.BytesIO()
+        psd.save(buffer)
+        data = buffer.getvalue()
 
-        # no preview file is written: the node hands the frontend a reference to
-        # the saved PSD and the JS extension turns it into a browser download
-        rel = os.path.join(subfolder, psd_name) if subfolder else psd_name
+        layer_count = len(pairs) + (1 if include_original else 0)
+
+        if save_to_disk:
+            with open(psd_path, "wb") as f:
+                f.write(data)
+            print(f"[Save PSD] {psd_name}: {layer_count} слоёв -> {psd_path}")
+            entry = {"filename": psd_name, "subfolder": subfolder, "type": "output"}
+            return {
+                "ui": {"psd": [entry], "text": [psd_path]},
+                "result": (psd_path, layer_count),
+            }
+
+        if not _ROUTE_READY:
+            raise RuntimeError(
+                "Save PSD: the in-memory download route could not be registered "
+                "(no PromptServer). Turn save_to_disk on to write the file into "
+                "ComfyUI/output instead."
+            )
+
+        token = _remember_psd(data, psd_name)
+        url = f"{_ROUTE}/{token}"
+        print(
+            f"[Save PSD] {psd_name}: {layer_count} слоёв, {len(data) / 1e6:.1f} МБ "
+            f"в памяти (на диск не пишем) -> кнопка download"
+        )
+        # The frontend gets a URL instead of an output-folder reference: the
+        # bytes are served once from RAM and disappear with the process.
         return {
             "ui": {
-                "psd": [
-                    {
-                        "filename": psd_name,
-                        "subfolder": subfolder,
-                        "type": "output",
-                    }
-                ],
-                "text": [rel],
+                "psd": [{"filename": psd_name, "url": url, "type": "memory"}],
+                "text": [psd_name],
             },
-            "result": (psd_path, len(pairs) + (1 if include_original else 0)),
+            "result": (url, layer_count),
         }
 
 

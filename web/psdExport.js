@@ -4,15 +4,22 @@ import { api } from "../../scripts/api.js";
 /**
  * Save PSD (masked layers)
  * ------------------------
- * The python node writes the PSD into ComfyUI's output folder and reports it
- * back as ui.psd. No preview file is produced; this extension only turns that
- * reference into a browser download button on the node.
+ * The python node reports the finished PSD back as ui.psd and this extension
+ * turns it into a download button on the node.
+ *
+ * By default the file never reaches the disk: python keeps the bytes in RAM
+ * and hands over a one-off URL, which is what `file.url` holds. Such a file
+ * dies with the ComfyUI process, so the button is NOT restored when a saved
+ * workflow is reopened - a reloaded page has nothing to download and the graph
+ * has to be run again. With save_to_disk on, the node reports an
+ * output-folder reference instead and that one does survive a reload.
  */
 
 const NODE_CLASS = "SavePSDLayers";
 const IDLE_LABEL = "⬇  download PSD";
 
 function fileUrl(file) {
+  if (file.url) return api.apiURL(file.url);
   const params = new URLSearchParams({
     filename: file.filename,
     subfolder: file.subfolder ?? "",
@@ -81,11 +88,14 @@ app.registerExtension({
       return r;
     };
 
-    // remember the file across workflow reloads
+    // A saved workflow may still carry the reference of an in-memory PSD from
+    // an earlier session; those bytes are long gone, so drop it and leave the
+    // button idle instead of handing the user a link that 404s.
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function () {
       const r = onConfigure?.apply(this, arguments);
       try {
+        if (this.properties?.lastPsd?.url) delete this.properties.lastPsd;
         ensureButton(this);
         setButtonState(this);
       } catch (e) {
